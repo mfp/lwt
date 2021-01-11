@@ -41,6 +41,15 @@ and t2 = do_something2 in
 bind t1 (fun x -> bind t2 (fun y -> code))
    ]}
 
+   Note that, as a direct consequence of the above rewriting, applying [Lwt.cancel]
+   on a promise created with [let%lwt ... and ...] may cancel only one of the
+   inner promises (or none at all), leaving the remaining branches running in the
+   background.
+
+   When given the [-letlwt-and-cancel] flag, the Ppx extension will perform
+   a different rewriting based on [Lwt.join] that guarantees proper cancelation
+   of all pending inner promises.
+
    Due to a {{:https://caml.inria.fr/mantis/view.php?id=7758} bug} in the OCaml
    parser, if you'd like to put a type constraint on the variable, please write
 

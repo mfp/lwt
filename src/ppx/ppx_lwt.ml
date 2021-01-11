@@ -41,6 +41,7 @@ let strict_seq = ref true
 
 let used_no_sequence_option = ref false
 let used_no_strict_sequence_option = ref false
+let letlwt_and_cancel = ref false
 
 let no_sequence_option () =
   sequence := false;
@@ -53,6 +54,8 @@ let no_strict_sequence_option () =
 (** let%lwt related functions *)
 
 let gen_name i = lwt_prefix ^ string_of_int i
+
+let gen_name' i = lwt_prefix ^ "'" ^ string_of_int i
 
 (** [p = x] ≡ [__ppx_lwt_$i = x] *)
 let gen_bindings l =
@@ -87,6 +90,100 @@ let gen_binds e_loc l e =
       { new_exp with pexp_attributes = binding.pvb_attributes }
   in aux 0 l
 
+(** [p = x] ≡ [__ppx_lwt_$i = ref None] *)
+let gen_bindings_new_semantics l =
+  let aux i binding =
+    { binding with
+      pvb_pat = pvar ~loc:binding.pvb_expr.pexp_loc (gen_name i);
+      pvb_expr = [%expr ref None];
+    }
+  in
+  List.mapi aux l
+
+(** [p1 = e1 and ... and en = xn in e] ≡
+    [let __ppx_lwt'$i =
+       Lwt.bind e1 (fun x -> __ppx_lwt$i := Some x; Lwt.return_unit)
+     in
+     ...
+     Lwt.bind
+       (Lwt.join [__ppx_lwt'1; ...; __ppx_lwt'n])
+       (fun () -> match !__ppx_lwt1, ..., !__ppx_lwtn with
+          | Some __ppx_lwt1,..., Some __ppx_lwtn ->
+             let p1 = __ppx_lwt1 in
+             ...
+             let pn = __ppx_lwtn in
+             e
+          | _ -> assert false)
+    ]
+   *)
+let gen_binds_new_semantics e_loc l e =
+  let rec aux i bindings = function
+    | [] ->
+      let ths =
+        List.fold_right
+          (fun name l -> [%expr (::) ([%e evar ~loc:e_loc name], [%e l])])
+        (List.init (List.length bindings) gen_name')
+        [%expr []]
+      in
+      let results =
+        Exp.tuple
+          ~loc:e_loc
+          (List.map (fun name -> [%expr ! [%e evar ~loc:e_loc name]]) @@
+           List.init (List.length bindings) gen_name)
+      in
+      let pat =
+        Pat.tuple
+          (List.mapi (fun i _ -> [%pat? (Some [%p pvar (gen_name i)])]) bindings)
+      in
+      let expr =
+        fst @@
+        List.fold_right
+          (fun binding (e, i) ->
+             let e =
+               Exp.let_
+                 ~loc:binding.pvb_loc
+                 Nonrecursive
+                 [{ binding with pvb_expr = evar ~loc:e_loc (gen_name i) }]
+                 e
+             in
+             (e, i - 1))
+          bindings (e, List.length bindings - 1)
+      in
+      [%expr
+         let module Reraise = struct external reraise : exn -> 'a = "%reraise" end in
+         Lwt.backtrace_bind
+           (fun exn -> try Reraise.reraise exn with exn -> exn)
+           (Lwt.join [%e ths])
+           (fun () ->
+              match [%e results] with
+              | [%p pat] -> [%e expr]
+              | _ -> assert false)
+       ] [@metaloc e_loc]
+
+    | binding :: tl ->
+      let expr =
+        [%expr
+          let module Reraise = struct external reraise : exn -> 'a = "%reraise" end in
+          Lwt.backtrace_bind
+            (fun exn -> try Reraise.reraise exn with exn -> exn)
+            [%e binding.pvb_expr]
+            (fun x -> [%e evar ~loc:binding.pvb_expr.pexp_loc (gen_name i)] := Some x; Lwt.return_unit)]
+        [@metaloc e_loc]
+      in
+      let new_exp =
+        Exp.let_
+          Nonrecursive
+          [
+            { binding with
+              pvb_pat = pvar ~loc:binding.pvb_expr.pexp_loc (gen_name' i);
+              pvb_expr = expr;
+            }
+          ]
+          (aux (i + 1) bindings tl)
+      in
+      { new_exp with pexp_attributes = binding.pvb_attributes }
+  in aux 0 l l
+
 (* Note: instances of [@metaloc !default_loc] below are workarounds for
     https://github.com/ocaml-ppx/ppx_tools_versioned/issues/21. *)
 
@@ -113,6 +210,16 @@ let lwt_expression mapper exp attributes ext_loc =
   (* $e$;%lwt $e'$ ≡ [Lwt.bind $e$ (fun $p$ -> $e'$)] *)
   | Pexp_sequence (lhs, rhs) ->
     Some (lwt_sequence mapper ~exp ~lhs ~rhs ~ext_loc)
+
+  | Pexp_let (Nonrecursive, vbl , e) when List.length vbl > 1 && !letlwt_and_cancel ->
+    let new_exp =
+      Exp.let_
+        Nonrecursive
+        (gen_bindings_new_semantics vbl)
+        (gen_binds_new_semantics exp.pexp_loc vbl e)
+    in
+    Some (mapper.expr mapper { new_exp with pexp_attributes })
+
   (* [let%lwt $p$ = $e$ in $e'$] ≡ [Lwt.bind $e$ (fun $p$ -> $e'$)] *)
   | Pexp_let (Nonrecursive, vbl , e) ->
     let new_exp =
@@ -358,6 +465,10 @@ let args =
     "-no-strict-sequence",
       Arg.Unit no_strict_sequence_option,
       " has no effect (deprecated)";
+
+    "-letlwt-and-cancel",
+      Arg.Set letlwt_and_cancel,
+      " give Lwt.join-like semantics to let%lwt ... and ... wrt. to cancel"
   ]
 
 let () =

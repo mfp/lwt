@@ -29,6 +29,27 @@ let suite = suite "ppx" [
        return (x + y = 7)
     ) ;
 
+  test "and let + cancel"
+    (fun () ->
+       let t1, _ = Lwt.task () in
+       let t2, _ = Lwt.task () in
+       let c1 = ref false in
+       let c2 = ref false in
+       let t =
+         let%lwt x =
+           try%lwt
+             let%lwt () = t1 in return 3
+           with Lwt.Canceled -> c1 := true; Lwt.return 1
+         and y =
+           try%lwt
+             let%lwt () = t2 in return 4
+           with Lwt.Canceled -> c2 := true; Lwt.return 2
+         in
+         return (x + y)
+       in
+       Lwt.cancel t;
+       return (!c1 && !c2)) ;
+
   test "match"
     (fun () ->
        let x = Lwt.return (Some 3) in

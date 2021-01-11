@@ -1,7 +1,7 @@
 (executable
  (name main)
  (libraries lwttester)
- (preprocess (pps lwt_ppx))
+ (preprocess (pps lwt_ppx -letlwt-and-cancel))
  (flags (:standard -warn-error -22)))
 
 (alias
